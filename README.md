@@ -135,14 +135,60 @@ don't touch the keyboard or mouse while it runs.
 Firefox runs with its own profile, not your everyday one, so your tabs and
 settings are left alone, and the test only touches the Firefox it started
 itself. The test writes a `user.js` into the profile that turns off first-run
-pages, quit prompts and crash recovery.
+pages, quit prompts and crash recovery, and turns on Firefox's fingerprinting
+protection (`privacy.resistFingerprinting`). With it on, Firefox reports a
+UTC+0 time zone (`Atlantic/Reykjavik`), a rounded screen size (e.g. 1200×600)
+and English as its language instead of your computer's. Its user agent drops
+details like the Linux distribution, but still shows Linux and the real Firefox
+version. It can't hide your IP address. The [fingerprint
+check](#fingerprint-check) shows what websites actually see.
 
-The profile is kept between runs, so if Google shows a cookie consent page you
-only need to accept it once: start Firefox with
-`firefox --no-remote --profile <profile path>` and accept it.
+The runs take turns using `PROFILES` profiles. By default there are as many
+profiles as runs, so every run starts as a fresh Firefox: no cookies, site
+data, cache or history. With fewer, e.g. `RUNS=5 PROFILES=2`, profile 1 is used
+by runs 1, 3 and 5 and profile 2 by runs 2 and 4; a profile keeps its cookies
+and history from its earlier runs. The run headers and summary show which
+profile each run used.
 
-Firefox's output from the latest run goes to `firefox.log` next to the profile
-folder.
+Each profile is a new, empty folder (`profile<number>-<random>`) in the
+profiles folder, with Firefox's output in `profile<number>-<random>.log` next
+to it. At the end of the test they are deleted, except profiles that had a
+failed run: the test prints where those are, so you can look at them; delete
+them by hand when you're done.
+
+A Google cookie consent page (in the EU) shows up on each profile's first run.
+
+### Fingerprint check
+
+`tests/fingerprint_check.py` checks what the test profiles show to websites,
+using [browserleaks.com](https://browserleaks.com) (its JavaScript and IP
+pages):
+
+```bash
+scripts/run_linux.sh tests/fingerprint_check.py
+```
+
+It opens the pages in `PROFILES` profiles (2 by default) with fingerprinting
+protection on, and in one control profile with it off, which shows what leaks
+without it. Then it checks that:
+
+- the time zone is UTC+0, not your computer's;
+- the language is English (if your computer uses English too, it says it can't
+  tell whether that was changed);
+- the screen size isn't the test display's;
+- the user agent differs from what Firefox reports without the protection;
+- `navigator.webdriver` is `false`;
+- all protected profiles show the same browser details, and every profile the
+  same IP address. Values that change by the moment (clocks) and the IP's WHOIS
+  details are left out of the comparison.
+
+It also shows the reported CPU count. Every value read is saved to a JSON
+report in `~/.cache/browser-smoke-test/` (or `REPORT=<path>`). The pages are
+read through the accessibility interface (AT-SPI), like the pop-up buttons.
+
+Run it from a normal terminal. Ubuntu's AppArmor rules don't let apps started
+from VS Code's terminal read the snap Firefox's pages; the check then fails
+with `waiting for ... to show its results`.
 
 ### Ubuntu settings
 
@@ -151,7 +197,10 @@ In addition to the [shared settings](#settings):
 | Variable             | Default | What it does |
 |----------------------|---------|--------------|
 | `BROWSER_CMD`        | `firefox` | Command that starts Firefox, e.g. `~/firefox-nightly/firefox` |
-| `FIREFOX_PROFILE`    | `~/snap/firefox/common/smoke-test-profile` for the snap, otherwise `~/.cache/browser-smoke-test/firefox-profile` | Profile folder for the test. The snap can only use folders under `~/snap/firefox/` or non-hidden folders in your home |
+| `FIREFOX_PROFILE_DIR` | `~/snap/firefox/common/smoke-test-profiles` for the snap, otherwise `~/.cache/browser-smoke-test/profiles` | Folder the profile folders are created in. The snap can only use folders under `~/snap/firefox/` or non-hidden folders in your home |
+| `PROFILES`           | same as `RUNS` | Number of profiles the runs take turns using |
+| `RESET_PROFILE`      | `1` | `0` to keep all profile folders at the end, not only those with a failed run |
+| `RESIST_FINGERPRINTING` | `1` | `0` to turn off Firefox's fingerprinting protection |
 | `LAUNCH_TIMEOUT`     | `60` | Seconds to wait for the Firefox window. The snap can be slow on its first start |
 | `HEADLESS`           | `0` | `1` to use an invisible display (Xvfb) instead of a window (Xephyr). `run_linux.sh` only |
 | `SCREEN_SIZE`        | `1280x800` | Size of the test display. `run_linux.sh` only |
@@ -168,8 +217,9 @@ See also the [shared troubleshooting](#troubleshooting).
 | `This is a Wayland session` | You ran `tests/smoke_search.py` directly on a Wayland desktop. Use `scripts/run_linux.sh`. |
 | `No window manager on display` | The test display has no window manager, so focus can't be checked. Use `scripts/run_linux.sh`, or install `openbox`. |
 | `Display :99 is already in use` | Another X server uses that number, maybe one left from an interrupted run. Use `DISPLAY_NUM=98`. |
-| `Firefox exited without opening a window` | The message shows the last lines of `firefox.log`. `cannot open display` means Firefox can't reach the test display. `already running` means a Firefox using the test profile is still open: close it. |
+| `Firefox exited without opening a window` | The message shows the last lines of the run's log. `cannot open display` means Firefox can't reach the test display. |
 | `Timed out ... Firefox to open a window` | Firefox is slow to start. Raise `LAUNCH_TIMEOUT`. |
+
 ## What each run does
 
 The same in both environments:
@@ -264,6 +314,6 @@ These apply in both environments. See also
 | Message | Likely cause and fix |
 |---------|----------------------|
 | `Browser lost focus` | Another window came to the front: a notification you clicked, or keyboard/mouse use. Run again without touching anything. On Ubuntu with `run_linux.sh`, don't click inside the test window. |
-| `Timed out ... the page titled 'Google' to load` | Google showed something other than its home page. In the EU this is often the cookie consent page: accept it once by hand in the browser (on Ubuntu, in the [test profile](#test-profile)). Also check your internet connection. |
+| `Timed out ... the page titled 'Google' to load` | Google showed something other than its home page. In the EU this is often the cookie consent page: accept it once by hand in the browser (on Ubuntu, it shows up on each test profile's first run: see [Test profile](#test-profile)). Also check your internet connection. |
 | `Timed out ... results page title to contain the query` | Google may be showing a CAPTCHA ("unusual traffic") after many automated searches. Wait a while or use fewer `RUNS`. On a slow computer, raise `TIMEOUT` or `STEP_DELAY`. |
 | `browser did not quit; force-quitting` | A pop-up blocked the quit. See [Pop-ups when quitting](#pop-ups-when-quitting). |

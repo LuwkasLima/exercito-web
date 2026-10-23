@@ -4,6 +4,7 @@
 #
 #   scripts/run_linux.sh              # in a window on your desktop (Xephyr), so you can watch
 #   HEADLESS=1 scripts/run_linux.sh   # on an invisible display (Xvfb), e.g. for CI
+#   scripts/run_linux.sh tests/fingerprint_check.py   # another script on the test display
 #
 # Other settings (RUNS, SEARCH_QUERY, ...) are passed through to the test.
 set -euo pipefail
@@ -59,4 +60,4 @@ for _ in $(seq 50); do
     sleep 0.1
 done
 
-python3 "$ROOT/tests/smoke_search.py"
+python3 "$ROOT/${1:-tests/smoke_search.py}"

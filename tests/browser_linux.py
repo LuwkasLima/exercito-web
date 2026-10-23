@@ -5,7 +5,8 @@ Wayland doesn't let one app type into another or read its window titles, so the
 browser must run on an X11 display: an Xorg session, or the Xephyr/Xvfb display
 that scripts/run_linux.sh starts.
 
-Firefox gets its own test profile. Only windows of the Firefox started by this
+Firefox runs in test profile folders the test creates, which runs can take
+turns using (see select_profile). Only windows of the Firefox started by this
 test are touched, so other Firefox windows on the same display are left alone.
 """
 import json
@@ -15,6 +16,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 from pathlib import Path
 
 from smoke_common import SmokeTestError, wait_for
@@ -37,24 +39,28 @@ USER_PREFS = {
     "browser.warnOnQuitShortcut": False,
     "browser.tabs.warnOnClose": False,
     "browser.sessionstore.resume_from_crash": False,
+    # Firefox's built-in fingerprinting protection: reports a common user agent,
+    # screen size, time zone (UTC) and language instead of this machine's.
+    "privacy.resistFingerprinting": os.environ.get("RESIST_FINGERPRINTING", "1") == "1",
+    # Request English pages without showing a prompt bar about it.
+    "privacy.spoof_english": 2,
 }
 
 TITLE_SUFFIX = re.compile(r"(^|\s+[—–-]\s+)Mozilla Firefox$")
 
 
-def default_profile():
-    if os.environ.get("FIREFOX_PROFILE"):
-        return Path(os.environ["FIREFOX_PROFILE"]).expanduser()
+def default_profile_dir():
+    if os.environ.get("FIREFOX_PROFILE_DIR"):
+        return Path(os.environ["FIREFOX_PROFILE_DIR"]).expanduser()
     # The snap can't see the host's /tmp or hidden folders in $HOME.
     if Path("/snap/bin/firefox").exists() and Path(BROWSER_CMD[0]).name == "firefox":
-        return Path.home() / "snap/firefox/common/smoke-test-profile"
+        return Path.home() / "snap/firefox/common/smoke-test-profiles"
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return cache / "browser-smoke-test/firefox-profile"
+    return cache / "browser-smoke-test/profiles"
 
 
-PROFILE = default_profile()
-# Firefox's output from the latest run, for when it fails to start.
-LOG = PROFILE.parent / "firefox.log"
+# The test's profile folders, and their Firefox logs next to them, are created in here.
+PROFILE_DIR = default_profile_dir()
 
 
 def tool(*args, check=True):
@@ -86,13 +92,43 @@ class Browser:
                 "focus can't be checked without one. Run scripts/run_linux.sh."
             )
         self.proc = None
+        self.profiles = {}  # profile number -> folder, created on first use
+        self.failed = set()  # folders of profiles that had a failed run
+        self.profile = None  # the folder the next launch uses
+        self.log = None  # Firefox's output with that profile, for when it fails to start
 
     def describe(self):
-        return (
-            f"{' '.join(BROWSER_CMD)} on display {os.environ['DISPLAY']}\n"
-            f"Profile: {PROFILE}\n"
-            f"Log:     {LOG}"
-        )
+        return f"{' '.join(BROWSER_CMD)} on display {os.environ['DISPLAY']}\nProfiles: in {PROFILE_DIR}"
+
+    def select_profile(self, number):
+        """Makes the next launch use profile `number`, creating a new, empty
+        folder for it on first use. Later runs with it keep its cookies etc."""
+        if number not in self.profiles:
+            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            self.profiles[number] = Path(tempfile.mkdtemp(prefix=f"profile{number}-", dir=PROFILE_DIR))
+        self.profile = self.profiles[number]
+        self.log = self.profile.with_name(self.profile.name + ".log")
+
+    def mark_failed(self):
+        """Records that a run with the current profile failed, so it's kept."""
+        if self.profile is not None:
+            self.failed.add(self.profile)
+
+    def cleanup_profiles(self, keep):
+        """Deletes the profile folders and logs created so far, except those of
+        failed runs (or all, if `keep`). Returns a note for each one kept."""
+        notes = []
+        running = self.is_running()
+        for profile in self.profiles.values():
+            log = profile.with_name(profile.name + ".log")
+            if keep or running or profile in self.failed:
+                notes.append(f"profile kept: {profile} (log: {log})")
+            else:
+                shutil.rmtree(profile, ignore_errors=True)
+                log.unlink(missing_ok=True)
+        self.profiles.clear()
+        self.profile = self.log = None
+        return notes
 
     def _ours(self, pid):
         # Firefox and its helpers stay in the process group started in launch().
@@ -115,16 +151,18 @@ class Browser:
         return int(result.stdout) if result.returncode == 0 else None
 
     def launch(self):
-        PROFILE.mkdir(parents=True, exist_ok=True)
-        (PROFILE / "user.js").write_text(
+        if self.profile is None:
+            self.select_profile(1)
+        (self.profile / "user.js").write_text(
             "".join(f'user_pref("{k}", {json.dumps(v)});\n' for k, v in USER_PREFS.items())
         )
         # DISABLE_WAYLAND stops the snap's launcher from forcing GDK_BACKEND=wayland
         # whenever the desktop's Wayland socket exists.
         env = dict(os.environ, MOZ_ENABLE_WAYLAND="0", DISABLE_WAYLAND="1", GNOME_ACCESSIBILITY="1")
-        with LOG.open("w") as log:
+        # Appended, so a failed run's output isn't lost to later runs with the profile.
+        with self.log.open("a") as log:
             self.proc = subprocess.Popen(
-                [*BROWSER_CMD, "--no-remote", "--profile", str(PROFILE)],
+                [*BROWSER_CMD, "--no-remote", "--profile", str(self.profile)],
                 env=env,
                 stdout=log,
                 stderr=log,
@@ -136,8 +174,8 @@ class Browser:
             timeout=LAUNCH_TIMEOUT,
         )
         if not self._windows():
-            last_lines = "\n    ".join(LOG.read_text(errors="replace").splitlines()[-5:])
-            raise SmokeTestError(f"Firefox exited without opening a window. From {LOG}:\n    {last_lines}")
+            last_lines = "\n    ".join(self.log.read_text(errors="replace").splitlines()[-5:])
+            raise SmokeTestError(f"Firefox exited without opening a window. From {self.log}:\n    {last_lines}")
 
     def activate(self):
         tool("xdotool", "windowactivate", str(self._windows()[-1][0]), check=False)
@@ -183,26 +221,69 @@ class Browser:
         for wid, _ in self._windows():
             tool("wmctrl", "-i", "-c", hex(wid), check=False)
 
-    def dismiss_popup(self, buttons):
-        """Clicks the first button named in `buttons`, found through the AT-SPI
-        accessibility tree; otherwise lists the buttons found."""
+    def _atspi_apps(self):
+        """Returns (Atspi, GLib, [this browser's apps in the AT-SPI accessibility
+        tree]); Atspi is None if the AT-SPI Python bindings aren't installed."""
         try:
             import gi
 
             gi.require_version("Atspi", "2.0")
             from gi.repository import Atspi, GLib
         except (ImportError, ValueError):
+            return None, None, []
+        apps = []
+        desktop = Atspi.get_desktop(0)
+        for i in range(desktop.get_child_count()):
+            app = desktop.get_child_at_index(i)
+            try:
+                if app is not None and self._ours(app.get_process_id()):
+                    apps.append(app)
+            except GLib.Error:
+                continue
+        return Atspi, GLib, apps
+
+    def page_rows(self, title):
+        """Returns the text of each table row on the open page titled `title`, as
+        a list of cell texts, read through the AT-SPI accessibility tree."""
+        Atspi, GLib, apps = self._atspi_apps()
+        if Atspi is None:
+            raise SmokeTestError("Can't read pages: install python3-gi and gir1.2-atspi-2.0")
+
+        def text(node):
+            # A node's own text has U+FFFC where each child's text goes.
+            parts = []
+            iface = node.get_text_iface()
+            if iface is not None:
+                parts.append(Atspi.Text.get_text(iface, 0, -1).replace("￼", " "))
+            parts += [text(node.get_child_at_index(j)) for j in range(node.get_child_count())]
+            return " ".join(" ".join(parts).split())
+
+        rows = []
+        stack = list(apps)
+        while stack:
+            node = stack.pop()
+            try:
+                role = node.get_role()
+                if role == Atspi.Role.DOCUMENT_WEB and title not in (node.get_name() or ""):
+                    continue  # another tab's page
+                if role == Atspi.Role.TABLE_ROW:
+                    rows.append([text(node.get_child_at_index(j)) for j in range(node.get_child_count())])
+                    continue
+                stack += reversed([node.get_child_at_index(j) for j in range(node.get_child_count())])
+            except GLib.Error:
+                continue
+        return rows
+
+    def dismiss_popup(self, buttons):
+        """Clicks the first button named in `buttons`, found through the AT-SPI
+        accessibility tree; otherwise lists the buttons found."""
+        Atspi, GLib, apps = self._atspi_apps()
+        if Atspi is None:
             return "can't look for buttons: install python3-gi and gir1.2-atspi-2.0"
 
         found = []
-        desktop = Atspi.get_desktop(0)
-        for i in range(desktop.get_child_count()):
-            stack = [desktop.get_child_at_index(i)]
-            try:
-                if stack[0] is None or not self._ours(stack[0].get_process_id()):
-                    continue
-            except GLib.Error:
-                continue
+        for app in apps:
+            stack = [app]
             while stack:
                 node = stack.pop()
                 try:
